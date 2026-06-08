@@ -675,3 +675,170 @@ photo-sync-data/
 # Brainstorming
 .superpowers/
 ```
+
+---
+
+## 13. 第三轮优化 — 深度优化（2026-06-08）
+
+### 13.1 USB 扫描路径可配置
+
+**问题：** 绿联 UGOS 不同版本 USB 挂载路径可能不同（`/media/`、`/mnt/`、`/run/media/`）。
+
+**修复方案：**
+- settings 中增加 `scan_paths` 字段，支持配置多个扫描路径
+- 首次启动自动探测常见路径是否存在
+- Docker Compose 中映射多个可能路径
+
+```yaml
+# docker-compose.yml volumes 示例
+volumes:
+  - /media:/media:ro
+  - /mnt:/mnt:ro
+  - /run/media:/run/media:ro
+  - /volume1/usb:/volume1/usb:ro
+  - /volume2/照片:/photos
+  - ./photo-sync-data:/app/data
+```
+
+```json
+// settings 默认值
+{
+  "scan_paths": ["/media", "/mnt", "/run/media"],
+  "poll_interval": 5
+}
+```
+
+### 13.2 同步中断恢复（断电/重启保护）
+
+**问题：** NAS 在同步中可能重启，留下半截文件，后续无法识别。
+
+**修复方案：**
+- 同步开始时在 `sync_history` 写入 `status=running`
+- 每个文件复制前记录目标路径到临时状态
+- 容器启动时检测 `status=running` 的历史记录：
+  - 扫描目标目录，删除不完整的文件（小于源文件大小）
+  - 标记该次同步为 `failed`
+- 文件复制使用**原子写入**：先写到临时文件，完成后 rename
+
+```python
+# 原子写入示例
+async def safe_copy(src: str, dst: str):
+    tmp = dst + ".partial"
+    await thread_copy(src, tmp)
+    os.rename(tmp, dst)  # 原子操作
+```
+
+### 13.3 文件名非法字符过滤
+
+**问题：** 自定义路径模板可能产生 `: * ? < > |` 等非法字符。
+
+**修复方案：**
+- 统一的 `sanitize_filename()` 函数：
+  - 替换 `\ / : * ? " < > |` 为下划线
+  - 去除首尾空格和 `.`
+  - 限制文件名长度（不超过 255 字符）
+- 在复制文件和创建目录前统一过滤
+
+### 13.4 大容量卡内存保护
+
+**问题：** 扫描 512GB 卡（数万文件）时内存可能溢出。
+
+**修复方案：**
+- 文件扫描使用 **生成器模式** 分批 yield：
+
+```python
+def scan_files(path: str, filters: dict):
+    """生成器：逐目录扫描，不加载全部到内存"""
+    for root, dirs, files in os.walk(path):
+        for file in files:
+            if matches_filters(file, filters):
+                yield os.path.join(root, file)
+        # 可选：释放已处理目录的内存
+```
+
+- 去重比对时，从数据库按哈希索引查询（O(1)），不加载全表
+- 同步队列限制最大排队数（默认 10000 条）
+
+### 13.5 数据库自动清理
+
+**问题：** sync_history 和 sync_logs 无限增长。
+
+**修复方案：**
+- settings 中增加配置项：
+  - `log_retention_days`（默认 90 天）
+  - `history_retention_days`（默认 365 天）
+- 后台 Worker 每天凌晨 3:00 执行清理：
+  - 删除过期日志
+  - 删除过期历史记录（保留 file_registry 用于去重）
+  - 执行 `PRAGMA optimize` 和可选 `VACUUM`
+
+### 13.6 首次使用引导（Setup Wizard）
+
+**问题：** 第一次打开网页时没有配置，用户不知道要做什么。
+
+**修复方案：**
+- 检测 `sync_profiles` 表是否为空 + settings 是否已初始化
+- 首次访问显示引导页面，三步走：
+  1. **设置同步目标目录**（默认 `/photos`）
+  2. **创建第一个同步配置**（引导填写名称、目标目录等）
+  3. **试试看** — "插入储存卡或点击手动同步"
+- 完成后进入正常 Dashboard
+
+### 13.7 健康检查与 Worker 自愈
+
+**问题：** Worker 异常退出后静默失效。
+
+**修复方案：**
+- Dockerfile 添加 `HEALTHCHECK`：
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8932/api/system/health')"
+```
+
+- FastAPI 启动时自动拉起 Worker 线程
+- settings 中增加 worker 心跳检测：
+  - Worker 每 10 秒更新一次心跳时间戳
+  - Web 服务检测到心跳超时（>30 秒）则自动重启 Worker
+- health 接口返回 Worker 状态：
+
+```json
+{
+  "status": "healthy",
+  "worker": {"alive": true, "last_heartbeat": "2026-06-08T12:00:00", "uptime_seconds": 3600},
+  "db": {"size_mb": 12.5, "journal_mode": "wal"},
+  "disk": {"/photos": {"free_gb": 1024, "total_gb": 4096}}
+}
+```
+
+### 13.8 多卡同步队列
+
+**问题：** 同时插入多张卡时，无排队机制和状态显示。
+
+**修复方案：**
+- 同步队列持久化到数据库（`sync_queue` 表）：
+
+```sql
+CREATE TABLE sync_queue (
+    id INTEGER PRIMARY KEY,
+    card_path TEXT NOT NULL,
+    card_label TEXT,
+    profile_id INTEGER,
+    status TEXT,  -- queued / running / completed / failed
+    queued_at DATETIME,
+    started_at DATETIME,
+    completed_at DATETIME,
+    history_id INTEGER  -- 关联 sync_history
+);
+```
+
+- 新增 API：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/sync/queue | 查看同步队列 |
+| POST | /api/sync/queue/{id}/cancel | 取消队列中的任务 |
+| POST | /api/sync/queue/reorder | 调整队列顺序 |
+
+- UI Dashboard 增加**队列面板**，显示排队和进行中的任务
+- Worker 按队列顺序逐个处理，单次只能运行一个同步任务
