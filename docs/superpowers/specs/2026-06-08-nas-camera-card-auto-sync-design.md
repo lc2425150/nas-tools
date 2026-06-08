@@ -1002,3 +1002,338 @@ services:
 - WS /ws/sync/status
 + WS /api/v1/ws/sync/status
 ```
+
+---
+
+## 15. 最终决策与遗漏补全（2026-06-08）
+
+### 15.1 项目名称
+- **正式名称：PhotoSync**
+- Docker 镜像名：`photosync:latest`
+- 容器名：`photosync`
+- 端口：8932
+
+### 15.2 前端 UI 方案：Tailwind CSS
+
+**决策理由：** 性能最优、资源消耗最小。
+
+**详细方案：**
+- **样式框架：** [Tailwind CSS](https://tailwindcss.com) v3+ — 按需生成 CSS，生产包通常 <10KB
+- **组件库：** 不引入重量级 UI 库，基于 Tailwind 自建轻量组件
+- **图标：** [Heroicons](https://heroicons.com)（SVG 内联，无运行时开销）
+- **深色模式：** Tailwind `dark:` 变体，根据 `prefers-color-scheme` 或手动切换
+- **状态管理：** Pinia（Vue 官方推荐，极小的 bundle 体积）
+- **构建工具：** Vite（开发 HMR 极快，生产构建通过 Tree-shaking 极致优化）
+
+**对比数据：**
+| 方案 | 生产包体积 | 首次加载 |
+|---|---|---|
+| Element Plus | ~1.2 MB | ❌ 较重 |
+| Naive UI | ~800 KB | ⚠️ 中等 |
+| **Tailwind CSS（选用）** | **<100 KB** | ✅ **极轻** |
+
+### 15.3 数据库迁移：Alembic
+
+- 使用 SQLAlchemy 官方迁移工具 Alembic
+- 每次 Schema 变更通过 `alembic revision --autogenerate` 生成迁移脚本
+- 容器启动时自动执行 `alembic upgrade head`
+
+```
+backend/
+  alembic/
+    versions/    # 迁移脚本
+  alembic.ini    # Alembic 配置
+```
+
+### 15.4 测试策略
+
+**后端测试：**
+- 框架：**pytest** + pytest-asyncio
+- Mock USB 模式：在临时目录创建虚拟文件结构模拟储存卡
+- 自动同步测试：创建模拟源目录 → 配置 profile → 执行同步 → 验证目标目录
+- 测试覆盖：service 层（核心同步逻辑）、api 层（接口）、dedup 层（去重）
+
+**前端测试：**
+- 框架：Vitest（与 Vite 共享配置）
+- 组件测试：Vue Test Utils + happy-dom
+- API Mock：MSW (Mock Service Worker)
+
+```python
+# 测试示例：Mock USB 检测
+def test_card_detection(tmp_path):
+    # 创建模拟储存卡目录
+    card = tmp_path / "SDCARD"
+    card.mkdir()
+    (card / "DCIM").mkdir()
+    (card / "DCIM" / "DSC_0001.ARW").write_bytes(b"mock_raw_data")
+    
+    detector = CardDetector(scan_paths=[str(tmp_path)])
+    cards = detector.scan()
+    assert len(cards) == 1
+    assert cards[0].label == "SDCARD"
+```
+
+### 15.5 开发环境搭建
+
+**docker-compose.dev.yml：**
+
+```yaml
+version: '3.8'
+services:
+  photosync-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8932:8932"
+      - "5173:5173"   # Vite HMR
+    volumes:
+      - ./backend:/app/backend    # 后端代码热重载
+      - ./frontend:/app/frontend  # 前端代码 HMR
+      - ./mock_usb:/mock_usb:ro   # 开发用虚拟 USB 目录
+      - ./dev_photos:/photos      # 开发用同步目标
+      - ./dev_data:/app/data      # 开发数据库
+    environment:
+      - TZ=Asia/Shanghai
+      - DEV_MODE=true
+      - POLL_INTERVAL=5
+      - PUID=1000
+      - PGID=100
+```
+
+**开发工作流：**
+1. 后端修改 → uvicorn 自动重载（`--reload`）
+2. 前端修改 → Vite HMR 毫秒级热更新
+3. 模拟卡：在 `mock_usb/` 目录创建子目录，Worker 会自动检测到
+4. 测试：`docker exec photosync-dev pytest`
+
+### 15.6 生产 Dockerfile（完整版）
+
+```dockerfile
+# ===== Stage 1: Build frontend =====
+FROM node:20-alpine AS frontend-builder
+WORKDIR /app
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
+RUN corepack enable && pnpm install --frozen-lockfile
+COPY frontend/ .
+RUN pnpm build
+
+# ===== Stage 2: Build Python dependencies =====
+FROM python:3.11-slim AS backend-builder
+WORKDIR /app
+COPY backend/requirements.txt .
+RUN pip install --user --no-cache-dirs -r requirements.txt
+
+# ===== Stage 3: Final image =====
+FROM python:3.11-slim
+WORKDIR /app
+
+# 系统运行时依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libjpeg62-turbo libwebp7 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制 Python 依赖和代码
+COPY --from=backend-builder /root/.local /root/.local
+COPY --from=frontend-builder /app/dist /app/static
+COPY backend/ /app/backend/
+
+# 创建入口脚本（处理 PUID/PGID）
+COPY <<'ENTRYPOINT' /app/entrypoint.sh
+#!/bin/bash
+set -e
+
+# 处理用户权限
+PUID=${PUID:-0}
+PGID=${PGID:-0}
+if [ "$PUID" != "0" ]; then
+    groupadd -g $PGID photosync 2>/dev/null || true
+    useradd -u $PUID -g $PGID -d /app photosync 2>/dev/null || true
+    chown -R $PUID:$PGID /app/data 2>/dev/null || true
+    exec su-exec photosync "$@"
+else
+    exec "$@"
+fi
+ENTRYPOINT
+
+RUN chmod +x /app/entrypoint.sh
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD curl -f http://localhost:8932/api/v1/system/health || exit 1
+
+# 日志目录
+VOLUME ["/app/data"]
+EXPOSE 8932
+
+ENV PATH="/root/.local/bin:${PATH}" \
+    PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8932", "--proxy-headers"]
+```
+
+### 15.7 最终 docker-compose.yml
+
+```yaml
+version: '3.8'
+services:
+  photosync:
+    image: photosync:latest
+    container_name: photosync
+    ports:
+      - "8932:8932"
+    volumes:
+      - /media:/media:ro
+      - /mnt:/mnt:ro
+      - /run/media:/run/media:ro
+      - /volume2/照片:/photos
+      - ./photosync-data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+      - PUID=1000
+      - PGID=100
+      - POLL_INTERVAL=5
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 128M
+    restart: unless-stopped
+```
+
+### 15.8 Python 依赖清单
+
+```
+# backend/requirements.txt
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+sqlalchemy[asyncio]==2.0.30
+aiosqlite==0.20.0
+alembic==1.13.1
+pydantic==2.7.0
+python-multipart==0.0.9
+websockets==12.0
+Pillow==10.3.0
+exifread==3.0.0
+aiofiles==23.2.1
+httpx==0.27.0            # 通知 HTTP 请求
+
+# 开发依赖
+# pytest==8.2.0
+# pytest-asyncio==0.23.0
+# httpx==0.27.0           # 测试用 TestClient
+```
+
+### 15.9 项目目录结构（终版）
+
+```
+PhotoSync/
+├── docker-compose.yml
+├── docker-compose.dev.yml
+├── Dockerfile
+├── Dockerfile.dev
+├── README.md
+├── .gitignore
+├── .env.example
+│
+├── backend/
+│   ├── requirements.txt
+│   ├── alembic.ini
+│   ├── alembic/
+│   │   ├── env.py
+│   │   └── versions/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py              # FastAPI 入口 + 生命周期
+│   │   ├── config.py            # 配置管理
+│   │   ├── database.py          # 数据库初始化
+│   │   ├── models.py            # SQLAlchemy 模型
+│   │   ├── schemas.py           # Pydantic 请求/响应
+│   │   ├── routers/
+│   │   │   ├── __init__.py
+│   │   │   ├── profiles.py
+│   │   │   ├── sync.py
+│   │   │   ├── cards.py
+│   │   │   ├── history.py
+│   │   │   ├── gallery.py
+│   │   │   ├── settings.py
+│   │   │   ├── notifications.py
+│   │   │   └── system.py
+│   │   ├── services/
+│   │   │   ├── __init__.py
+│   │   │   ├── card_detector.py
+│   │   │   ├── sync_engine.py
+│   │   │   ├── file_organizer.py
+│   │   │   ├── file_scanner.py
+│   │   │   ├── dedup.py
+│   │   │   ├── checksum.py
+│   │   │   ├── thumbnail.py
+│   │   │   ├── notification.py
+│   │   │   └── ws_manager.py
+│   │   └── worker.py
+│   └── tests/
+│       ├── conftest.py
+│       ├── test_card_detector.py
+│       ├── test_sync_engine.py
+│       ├── test_dedup.py
+│       └── test_api.py
+│
+├── frontend/
+│   ├── package.json
+│   ├── vite.config.js
+│   ├── tailwind.config.js
+│   ├── postcss.config.js
+│   ├── index.html
+│   ├── src/
+│   │   ├── App.vue
+│   │   ├── style.css              # Tailwind 入口
+│   │   ├── router/index.js
+│   │   ├── stores/
+│   │   │   ├── sync.js
+│   │   │   ├── profiles.js
+│   │   │   └── settings.js
+│   │   ├── api/
+│   │   │   ├── client.js
+│   │   │   ├── profiles.js
+│   │   │   ├── sync.js
+│   │   │   ├── history.js
+│   │   │   └── settings.js
+│   │   ├── views/
+│   │   │   ├── Dashboard.vue
+│   │   │   ├── SetupWizard.vue
+│   │   │   ├── Profiles.vue
+│   │   │   ├── ProfileDetail.vue
+│   │   │   ├── History.vue
+│   │   │   ├── HistoryDetail.vue
+│   │   │   ├── CardBrowser.vue
+│   │   │   ├── Gallery.vue
+│   │   │   ├── Settings.vue
+│   │   │   └── Logs.vue
+│   │   ├── components/
+│   │   │   ├── StatusCard.vue
+│   │   │   ├── SyncProgress.vue
+│   │   │   ├── StorageChart.vue
+│   │   │   ├── FileList.vue
+│   │   │   ├── GalleryGrid.vue
+│   │   │   ├── PhotoViewer.vue
+│   │   │   ├── NotificationConfig.vue
+│   │   │   ├── ThemeToggle.vue
+│   │   │   ├── EmptyState.vue
+│   │   │   └── QueuePanel.vue
+│   │   ├── composables/
+│   │   │   ├── useWebSocket.js
+│   │   │   └── useTheme.js
+│   │   └── assets/
+│   └── public/
+│       └── favicon.ico
+│
+├── mock_usb/                     # 开发用模拟卡（不提交 git）
+├── dev_photos/                   # 开发用同步目录
+├── dev_data/                     # 开发数据库
+│
+└── photosync-data/               # 生产数据库（docker volume）
+```
