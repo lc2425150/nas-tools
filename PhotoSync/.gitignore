@@ -1,0 +1,25 @@
+# Node
+node_modules/
+frontend/dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Docker data
+data/
+photosync-data/
+dev_data/
+dev_photos/
+mock_usb/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Brainstorming
+.superpowers/

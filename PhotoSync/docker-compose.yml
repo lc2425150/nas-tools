@@ -1,0 +1,27 @@
+version: '3.8'
+services:
+  photosync:
+    build: .
+    container_name: photosync
+    ports:
+      - "8932:8932"
+    volumes:
+      - /media:/media:ro
+      - /mnt:/mnt:ro
+      - /run/media:/run/media:ro
+      - /volume2/照片:/photos:rw
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+      - PUID=1000
+      - PGID=100
+      - POLL_INTERVAL=5
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 128M
+    restart: unless-stopped
