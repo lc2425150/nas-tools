@@ -842,3 +842,163 @@ CREATE TABLE sync_queue (
 
 - UI Dashboard 增加**队列面板**，显示排队和进行中的任务
 - Worker 按队列顺序逐个处理，单次只能运行一个同步任务
+
+---
+
+## 14. 第四轮优化 — 深度兼容 & 运维（2026-06-08）
+
+### 14.1 文件权限（PUID/PGID 支持）
+
+**问题：** 容器默认以 root 运行，同步的照片文件属主为 root，NAS 网页上无法删除/移动。
+
+**修复方案：**
+- 支持 `PUID` 和 `PGID` 环境变量，容器以指定用户运行
+- 创建同步目标目录时自动 chown
+
+```yaml
+# docker-compose.yml
+services:
+  photo-sync:
+    environment:
+      - PUID=1000      # NAS 上你的用户名 UID
+      - PGID=100       # NAS 上用户组 GID
+```
+
+- 默认值：`PUID=0 PGID=0`（兼容现有行为）
+- 启动脚本自动创建用户并切换到该用户运行 FastAPI + Worker
+
+### 14.2 隐藏文件自动过滤
+
+**问题：** macOS 的 `._` 文件、`.DS_Store`、Windows 的 `Thumbs.db` 等系统文件污染同步目录。
+
+**修复方案：**
+- 内置不可配置的默认忽略列表：
+  ```
+  .DS_Store, ._*, Thumbs.db, desktop.ini, .Trashes, .fseventsd, .Spotlight-V100
+  ```
+- 文件扫描器自动跳过匹配的文件和目录
+- 忽略规则始终生效，不依赖用户配置
+
+### 14.3 路径穿越防护
+
+**问题：** API 中用户传入的路径可能包含 `../` 导致越权访问。
+
+**修复方案：**
+- 统一的 `validate_path()` 函数处理所有用户路径输入
+- 规则：
+  - 禁止 `..`、`~`、符号链接
+  - 目标路径必须在 `/photos` 下（配置的目标根目录）
+  - 扫描路径必须在已配置的 `scan_paths` 范围内
+- 使用 `os.path.realpath()` 解析后再校验前缀：
+
+```python
+def validate_path(user_path: str, allowed_base: str) -> str:
+    real = os.path.realpath(user_path)
+    if not real.startswith(os.path.realpath(allowed_base)):
+        raise ValueError(f"路径 {user_path} 越权访问")
+    return real
+```
+
+### 14.4 Docker 日志标准输出
+
+**问题：** 日志只写到 SQLite，`docker logs` 看不到。
+
+**修复方案：**
+- Python logging 配置**双写**：
+  - Handler 1: stdout（JSON 格式，供 `docker logs` 查看）
+  - Handler 2: SQLite（供网页日志查看器使用）
+
+```python
+import logging, json, sys
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "time": self.formatTime(record),
+            "level": record.levelname,
+            "module": record.module,
+            "message": record.getMessage()
+        }, ensure_ascii=False)
+
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setFormatter(JsonFormatter())
+```
+
+### 14.5 资源限制默认值
+
+**问题：** 不给容器设资源限制可能影响 NAS 上其他服务。
+
+**修复方案：**
+```yaml
+# docker-compose.yml 推荐配置
+services:
+  photo-sync:
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 128M
+```
+
+### 14.6 照片画廊浏览
+
+**问题：** 已同步的照片只能在文件列表中看缩略图，没有浏览模式。
+
+**修复方案：**
+- 新增页面 **Gallery（画廊）**
+  - 按日期/目录分组浏览
+  - 网格视图展示缩略图
+  - 点击照片打开大图预览
+  - 支持左右切换上一张/下一张
+  - EXIF 信息显示（光圈、快门、ISO、焦距、相机型号）
+- 新增 API：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/v1/gallery | 照片列表（?date=&directory=&page=） |
+| GET | /api/v1/gallery/{file_id} | 单张照片信息 |
+| GET | /api/v1/gallery/{file_id}/image | 原图下载 |
+| GET | /api/v1/gallery/{file_id}/thumbnail | 缩略图 |
+
+### 14.7 同步进度预估时间
+
+**问题：** 进度只显示文件计数，不知道还要等多久。
+
+**修复方案：**
+- WebSocket 推送消息增加速度和时间字段：
+
+```json
+{
+  "type": "sync_progress",
+  "current": 45,
+  "total": 120,
+  "current_bytes": 2147483648,
+  "total_bytes": 53687091200,
+  "speed_mbps": 85.3,
+  "elapsed_seconds": 180,
+  "eta_seconds": 720,
+  "file": "DSC_0045.ARW"
+}
+```
+
+- 前端进度条同时显示：`45 / 120 文件 (2.0GB / 50GB) · 85.3 MB/s · 预计剩余 12 分钟`
+
+### 14.8 API 版本管理
+
+**问题：** 无版本前缀，未来升级不兼容会断掉前端。
+
+**修复方案：**
+- 所有 API 加上 `/api/v1/` 前缀
+- FastAPI 使用 `APIRouter(prefix="/api/v1")` 统一管理
+- 当前所有接口从 `/api/xxx` 改为 `/api/v1/xxx`
+
+**最终 API 列表示例：**
+```diff
+- GET /api/profiles
++ GET /api/v1/profiles
+- WS /ws/sync/status
++ WS /api/v1/ws/sync/status
+```
