@@ -507,3 +507,171 @@ photo-sync/
 - 默认 4 个并行文件传输
 - 可在设置中调整（1-10）
 - 避免过多并行导致 NAS I/O 过载
+
+---
+
+## 12. 第二轮优化（2026-06-08）
+
+### 12.1 SQLite 并发写入保护
+
+**问题：** FastAPI 异步请求 + 后台 Worker 可能同时写数据库，SQLite 默认序列化写入会导致 "database is locked"。
+
+**修复方案：**
+- 启用 **WAL 模式**（Write-Ahead Logging）：读写不互斥
+- 使用 `aiosqlite` + SQLAlchemy 异步引擎，单连接串行化
+- 数据库写操作通过 **单线程队列** 处理，避免并发写入
+
+```python
+# database.py 关键配置
+engine = create_async_engine(
+    "sqlite+aiosqlite:///data/photo-sync.db",
+    connect_args={"check_same_thread": False}
+)
+# 启动时执行 PRAGMA journal_mode=WAL;
+# 同步引擎写操作通过 asyncio.Lock 保护
+```
+
+### 12.2 异步文件 I/O
+
+**问题：** Python 的文件读写是同步阻塞的，直接 await 会阻塞事件循环。
+
+**修复方案：**
+- 大文件复制使用 `asyncio.to_thread()` 放到线程池
+- 小文件使用 `aiofiles` 异步库
+- 同步引擎独立于 FastAPI 事件循环，在后台线程中运行
+
+```python
+# 文件复制示例
+async def copy_file(src: str, dst: str):
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _sync_copy, src, dst)
+
+def _sync_copy(src: str, dst: str):
+    shutil.copy2(src, dst)  # 同步复制，在线程池中执行
+```
+
+### 12.3 Docker 镜像优化
+
+**问题：** rawpy 依赖 libraw C 库，安装时需要编译工具链，镜像膨胀到 500MB+。
+
+**修复方案：**
+- **多阶段构建**：builder 阶段安装编译依赖，最终镜像只保留运行库
+- RAW 缩略图改用 `Pillow` + `exifread` 组合（不依赖 C 扩展），仅提取 JPEG 预览图
+- 最终镜像基于 `python:3.11-slim`，仅安装必要的系统库
+
+```dockerfile
+# 多阶段 Dockerfile
+FROM python:3.11-slim AS builder
+RUN apt-get update && apt-get install -y build-essential
+COPY requirements.txt .
+RUN pip install --user -r requirements.txt
+
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y libjpeg62-turbo
+COPY --from=builder /root/.local /root/.local
+COPY ./backend /app/backend
+COPY ./frontend/dist /app/static
+EXPOSE 8932
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8932"]
+```
+
+**预期镜像大小：** ~180MB（vs 未优化时的 500MB+）
+
+### 12.4 Dry-Run 预览同步
+
+**新增功能：** 正式同步前预览将有哪些文件被同步。
+
+**新增 API：**
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | /api/sync/dry-run | 预览同步（只扫描不复制） |
+| GET | /api/sync/dry-run/{task_id} | 获取预览结果 |
+
+**返回格式：**
+```json
+{
+  "total_files": 120,
+  "total_size": 5368709120,
+  "new_files": 85,
+  "new_size": 4294967296,
+  "skipped_files": 35,
+  "skipped_size": 1073741824,
+  "files": [
+    {"name": "DSC_0045.ARW", "size": 52428800, "will_copy": true, "reason": "新文件"},
+    {"name": "DSC_0044.ARW", "size": 50331648, "will_copy": false, "reason": "已同步过"}
+  ]
+}
+```
+
+**前端交互：** 点击"预览同步"→ 展示文件列表和统计 → 用户确认后执行实际同步。
+
+### 12.5 统一 API 错误响应
+
+**新增约定：** 所有 API 错误返回统一格式。
+
+```json
+// 400 Bad Request
+{
+  "error": {
+    "code": "INVALID_PROFILE_NAME",
+    "message": "配置名称不能为空"
+  }
+}
+
+// 404 Not Found
+{
+  "error": {
+    "code": "PROFILE_NOT_FOUND",
+    "message": "配置 ID 123 不存在"
+  }
+}
+
+// 409 Conflict
+{
+  "error": {
+    "code": "SYNC_IN_PROGRESS",
+    "message": "当前已有同步任务进行中"
+  }
+}
+
+// 500 Internal Server Error
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "文件复制失败: /media/DCIM/DSC_0045.ARW"
+  }
+}
+```
+
+**错误码规范：** `{RESOURCE}_{ISSUE}` 格式，大写蛇形。
+
+### 12.6 用户界面语言
+
+- 默认语言：**简体中文**
+- 所有 UI 文本、通知消息、日志输出均为中文
+- 未来可扩展 i18n 支持，但第一期不做多语言
+
+### 12.7 .gitignore 补充
+
+```
+# Node
+node_modules/
+frontend/dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Docker data
+data/
+photo-sync-data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Brainstorming
+.superpowers/
+```
