@@ -1,0 +1,2 @@
+import { api } from './client'
+export const syncApi = { trigger:(pid,sp)=>api.post(`/sync/trigger?profile_id=${pid}&source_path=${encodeURIComponent(sp)}`), status:()=>api.get('/sync/status'), cancel:()=>api.post('/sync/cancel'), dryRun:(pid,sp)=>api.post(`/sync/dry-run?profile_id=${pid}&source_path=${encodeURIComponent(sp)}`), getQueue:()=>api.get('/sync/queue'), cancelQueue:id=>api.post(`/sync/queue/${id}/cancel`) }
