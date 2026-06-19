@@ -4,7 +4,7 @@
 #define DEFAULT_SECRET    @"tPn9xaosme5iJYF0bfk4Bz-HEfoEMgnx96t32ImWPp0"
 #define CHECK_INTERVAL    300
 
-@interface AppDelegate : NSObject <NSApplicationDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @property (strong) NSWindow *window;
 @property (strong) NSTextField *ipLabel;
 @property (strong) NSTextField *statusLabel;
@@ -209,6 +209,10 @@
 
 - (void)showWin {
     if (self.configView) { [self.configView removeFromSuperview]; self.configView = nil; }
+    if (!self.window) {
+        [self setupWindow];
+        return;
+    }
     [self.window center];
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
@@ -392,6 +396,12 @@
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return NO; }
 - (void)applicationWillTerminate:(NSNotification *)note { [self stopTimer]; }
+
+// 关闭窗口时只隐藏不退出
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    [self.window orderOut:self];
+    return NO;
+}
 
 @end
 
