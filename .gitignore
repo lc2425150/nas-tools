@@ -1,0 +1,7 @@
+build/
+*.app
+
+# WeComAPISync
+WeComAPISync/build/
+WeComAPISync/*.app
+*.app
