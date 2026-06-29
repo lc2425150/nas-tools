@@ -17,6 +17,20 @@ class MacOSUISourceTests(unittest.TestCase):
         self.assertIn("statusIcon.template = YES", source)
         self.assertNotIn('self.statusItem.button.title = @"IP"', source)
 
+    def test_default_interval_is_thirty_minutes(self):
+        source = (PROJECT_ROOT / "app" / "main.m").read_text(encoding="utf-8")
+        self.assertIn("#define CHECK_INTERVAL    1800", source)
+        config = (PROJECT_ROOT / "sync" / "config.py").read_text(encoding="utf-8")
+        self.assertIn("DEFAULT_INTERVAL = 1800", config)
+
+    def test_network_changes_trigger_debounced_sync(self):
+        source = (PROJECT_ROOT / "app" / "main.m").read_text(encoding="utf-8")
+        self.assertIn("#import <SystemConfiguration/SystemConfiguration.h>", source)
+        self.assertIn("SCDynamicStoreCreate", source)
+        self.assertIn("SCDynamicStoreSetNotificationKeys", source)
+        self.assertIn("networkChangeTimer", source)
+        self.assertIn("@selector(syncAfterNetworkChange)", source)
+
 
 if __name__ == "__main__":
     unittest.main()

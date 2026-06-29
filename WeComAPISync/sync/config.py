@@ -7,7 +7,7 @@ from pathlib import Path
 
 DEFAULT_CORPID = "wwedd915ec24199490"
 DEFAULT_SECRET = ""
-DEFAULT_INTERVAL = 300
+DEFAULT_INTERVAL = 1800
 
 
 @dataclass(frozen=True)

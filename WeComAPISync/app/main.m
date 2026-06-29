@@ -1,8 +1,10 @@
 #import <Cocoa/Cocoa.h>
+#import <SystemConfiguration/SystemConfiguration.h>
 
 #define DEFAULT_CORPID    @"wwedd915ec24199490"
 #define DEFAULT_SECRET    @""
-#define CHECK_INTERVAL    300
+#define CHECK_INTERVAL    1800
+#define NETWORK_SYNC_DEBOUNCE 8.0
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property (strong) NSWindow *window;
@@ -17,12 +19,26 @@
 @property (strong) NSView *configView;
 @property (strong) NSStatusItem *statusItem;
 @property (strong) NSTimer *checkTimer;
+@property (strong) NSTimer *networkChangeTimer;
 @property (strong) NSString *corpID;
 @property (strong) NSString *corpSecret;
+@property (assign) SCDynamicStoreRef networkStore;
+@property (assign) CFRunLoopSourceRef networkRunLoopSource;
 @property (assign) BOOL isRunning;
 @property (assign) BOOL isChecking;
 @property (assign) NSInteger checkInterval;
 @end
+
+@interface AppDelegate ()
+- (void)scheduleNetworkChangeSync;
+@end
+
+static void NetworkChangedCallback(SCDynamicStoreRef store, CFArrayRef changedKeys, void *info) {
+    AppDelegate *delegate = (__bridge AppDelegate *)info;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [delegate scheduleNetworkChangeSync];
+    });
+}
 
 @implementation AppDelegate
 
@@ -91,14 +107,15 @@
     });
 }
 
-- (void)syncOnce {
+- (void)syncWithForce:(BOOL)force status:(NSString *)status {
     if (self.isChecking) return;
     self.isChecking = YES;
-    [self updateStatus:@"正在同步并验证企业微信后台页面..."];
+    [self updateStatus:status ?: @"正在静默检测公网 IP..."];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSString *error = nil;
-        NSDictionary *result = [self runSyncCommand:@[@"--once"] error:&error];
+        NSArray<NSString *> *arguments = force ? @[@"--once", @"--force"] : @[@"--once"];
+        NSDictionary *result = [self runSyncCommand:arguments error:&error];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.isChecking = NO;
             NSString *ip = result[@"ip"];
@@ -106,16 +123,30 @@
 
             BOOL ok = [result[@"ok"] boolValue];
             BOOL verified = [result[@"verified"] boolValue];
+            NSString *resultStatus = result[@"status"] ?: @"";
             NSString *message = result[@"message"] ?: error ?: @"未知错误";
             if (ok && verified) {
-                [self updateStatus:[NSString stringWithFormat:@"已真实同步并验证：%@", ip ?: @""]];
-                self.timeLabel.stringValue = [NSString stringWithFormat:@"上次验证: %@", [self dateString]];
+                if ([resultStatus isEqualToString:@"unchanged"]) {
+                    [self updateStatus:[NSString stringWithFormat:@"静默检测完成：IP 未变化 %@", ip ?: @""]];
+                    self.timeLabel.stringValue = [NSString stringWithFormat:@"上次检测: %@", [self dateString]];
+                } else {
+                    [self updateStatus:[NSString stringWithFormat:@"已真实同步并验证：%@", ip ?: @""]];
+                    self.timeLabel.stringValue = [NSString stringWithFormat:@"上次验证: %@", [self dateString]];
+                }
             } else {
                 [self updateStatus:[NSString stringWithFormat:@"未验证成功：%@", message]];
                 self.timeLabel.stringValue = [NSString stringWithFormat:@"上次尝试: %@", [self dateString]];
             }
         });
     });
+}
+
+- (void)syncOnce {
+    [self syncWithForce:NO status:@"正在静默检测公网 IP..."];
+}
+
+- (void)manualSyncOnce {
+    [self syncWithForce:YES status:@"正在手动同步并验证企业微信后台页面..."];
 }
 
 - (void)startTimer {
@@ -144,7 +175,7 @@
     self.corpID = [defaults stringForKey:@"cid"] ?: DEFAULT_CORPID;
     self.corpSecret = [defaults stringForKey:@"csec"] ?: DEFAULT_SECRET;
     NSInteger savedInterval = [defaults integerForKey:@"interval"];
-    self.checkInterval = savedInterval > 0 ? savedInterval : CHECK_INTERVAL;
+    self.checkInterval = savedInterval >= CHECK_INTERVAL ? savedInterval : CHECK_INTERVAL;
 }
 
 - (void)saveConfig {
@@ -184,13 +215,69 @@
     show.target = self;
     [menu addItem:show];
 
-    NSMenuItem *sync = [[NSMenuItem alloc] initWithTitle:@"立即同步" action:@selector(syncOnce) keyEquivalent:@"s"];
+    NSMenuItem *sync = [[NSMenuItem alloc] initWithTitle:@"立即同步" action:@selector(manualSyncOnce) keyEquivalent:@"s"];
     sync.target = self;
     [menu addItem:sync];
 
     [menu addItem:[NSMenuItem separatorItem]];
     [menu addItemWithTitle:@"退出" action:@selector(terminate:) keyEquivalent:@"q"];
     self.statusItem.menu = menu;
+}
+
+- (void)setupNetworkMonitor {
+    if (self.networkStore) return;
+
+    SCDynamicStoreContext context = {0, (__bridge void *)self, NULL, NULL, NULL};
+    self.networkStore = SCDynamicStoreCreate(NULL, CFSTR("WeComIPSyncNetworkMonitor"), NetworkChangedCallback, &context);
+    if (!self.networkStore) return;
+
+    NSArray *patterns = @[
+        @"State:/Network/Global/IPv4",
+        @"State:/Network/Global/IPv6",
+        @"State:/Network/Interface/.*/IPv4",
+        @"State:/Network/Interface/.*/IPv6",
+    ];
+    if (!SCDynamicStoreSetNotificationKeys(self.networkStore, NULL, (__bridge CFArrayRef)patterns)) {
+        CFRelease(self.networkStore);
+        self.networkStore = NULL;
+        return;
+    }
+
+    self.networkRunLoopSource = SCDynamicStoreCreateRunLoopSource(NULL, self.networkStore, 0);
+    if (!self.networkRunLoopSource) {
+        CFRelease(self.networkStore);
+        self.networkStore = NULL;
+        return;
+    }
+    CFRunLoopAddSource(CFRunLoopGetMain(), self.networkRunLoopSource, kCFRunLoopCommonModes);
+}
+
+- (void)teardownNetworkMonitor {
+    [self.networkChangeTimer invalidate];
+    self.networkChangeTimer = nil;
+    if (self.networkRunLoopSource) {
+        CFRunLoopSourceInvalidate(self.networkRunLoopSource);
+        CFRelease(self.networkRunLoopSource);
+        self.networkRunLoopSource = NULL;
+    }
+    if (self.networkStore) {
+        CFRelease(self.networkStore);
+        self.networkStore = NULL;
+    }
+}
+
+- (void)scheduleNetworkChangeSync {
+    if (!self.isRunning) return;
+    [self.networkChangeTimer invalidate];
+    self.networkChangeTimer = [NSTimer scheduledTimerWithTimeInterval:NETWORK_SYNC_DEBOUNCE target:self selector:@selector(syncAfterNetworkChange) userInfo:nil repeats:NO];
+    [[NSRunLoop mainRunLoop] addTimer:self.networkChangeTimer forMode:NSRunLoopCommonModes];
+    [self updateStatus:@"检测到网络变化，稍后自动同步..."];
+}
+
+- (void)syncAfterNetworkChange {
+    self.networkChangeTimer = nil;
+    if (!self.isRunning) return;
+    [self syncWithForce:NO status:@"网络变化后正在检测公网 IP..."];
 }
 
 - (void)showWindow {
@@ -248,7 +335,7 @@
     [self setButton:syncButton title:@"立即同步" fontSize:12 weight:NSFontWeightRegular];
     syncButton.bezelStyle = NSBezelStyleRounded;
     syncButton.target = self;
-    syncButton.action = @selector(syncOnce);
+    syncButton.action = @selector(manualSyncOnce);
     [view addSubview:syncButton];
 
     NSBox *separator = [[NSBox alloc] initWithFrame:NSMakeRect(30, 188, 460, 1)];
@@ -334,7 +421,7 @@
     NSString *corpID = [self.corpIDField.stringValue stringByTrimmingCharactersInSet:trimSet];
     NSString *secret = [self.secretField.stringValue stringByTrimmingCharactersInSet:trimSet];
     NSInteger interval = self.intervalField.stringValue.integerValue;
-    if (interval < 60) interval = 60;
+    if (interval < CHECK_INTERVAL) interval = CHECK_INTERVAL;
     if (!corpID.length || !secret.length) {
         NSAlert *alert = [[NSAlert alloc] init];
         alert.messageText = @"配置不完整";
@@ -364,11 +451,12 @@
     [self loadConfig];
     [self setupMenuBar];
     [self setupWindow];
+    [self setupNetworkMonitor];
     [self refreshIP];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return NO; }
-- (void)applicationWillTerminate:(NSNotification *)note { [self stopTimer]; }
+- (void)applicationWillTerminate:(NSNotification *)note { [self stopTimer]; [self teardownNetworkMonitor]; }
 
 @end
 

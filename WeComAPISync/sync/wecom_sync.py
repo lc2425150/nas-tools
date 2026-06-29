@@ -56,7 +56,7 @@ def main() -> int:
             ip = get_public_ip()
             print(json.dumps(result(True, ip, "ip", ip), ensure_ascii=False))
             return 0
-        output = sync_once(force=args.force or args.once)
+        output = sync_once(force=args.force)
         print(json.dumps(output, ensure_ascii=False))
         return 0 if output["ok"] else 1
     except Exception as exc:

@@ -51,3 +51,7 @@ archive/old_attempts/      历史试验方案归档
 ~/.wecom-ip-sync/last_failure.png
 ~/.wecom-ip-sync/sync.log
 ```
+
+## 后台检测
+
+点击「开始监控」后，工具会每 30 分钟静默检测一次公网 IP；如果 IP 没变化，不会打开浏览器打扰。Mac 网络切换、Wi-Fi 重连等网络变化发生后，也会防抖等待数秒并自动检测同步。

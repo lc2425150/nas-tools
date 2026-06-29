@@ -11,7 +11,7 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources/sync"
 
-clang -fobjc-arc -framework Cocoa \
+clang -fobjc-arc -framework Cocoa -framework SystemConfiguration \
   -o "$APP_DIR/Contents/MacOS/WeComAPISync" \
   "$PROJECT_DIR/app/main.m"
 
